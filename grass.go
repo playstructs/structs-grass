@@ -44,7 +44,6 @@ func main() {
 		return
 	}
 
-
 	fmt.Printf("Channel: %s\n", topic)
 	
 	fmt.Printf("Connecting to NATS: %s \n", natHost)
