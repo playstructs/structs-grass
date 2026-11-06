@@ -2,121 +2,182 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
-	"log/slog"
+	"log"
 	"os"
-	"path/filepath"
-//	"time"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
 
-	"github.com/brojonat/notifier/notifier"
-	"github.com/jackc/pgx/v5/pgxpool"
-
+	"github.com/jackc/pgx/v5"
 	"github.com/nats-io/nats.go"
-	"github.com/tidwall/gjson"
 )
 
-/* 
- * Initial code provided by Jon Brown 
- * https://brojonat.com/posts/go-postgres-listen-notify/
- */
+const (
+	queueSize  = 1024
+	batchSize  = 128
+	retryDelay = 2 * time.Second
+)
 
-func main() {
+type message struct {
+	subject string
+	body    []byte
+}
 
-	ctx := context.Background()
-	l := getDefaultLogger(slog.LevelInfo)
-
-	var url string
-	flag.StringVar(&url, "dbhost", "", "DB host (postgresql://{user}:{password}@{hostname}/{db}?sslmode=require)")
-
-	var topic string
-	flag.StringVar(&topic, "channel", "", "a string")
-
-	var natHost string
-	flag.StringVar(&natHost, "nathost", "", "NAT host (nats://{hostname}:{port})") // default port 4222
-
-
-	flag.Parse()
-
-	if url == "" || topic == "" || natHost == "" {
-		fmt.Fprintf(os.Stderr, "missing required flag")
-		os.Exit(1)
-		return
+func parseMessage(payload string) (message, error) {
+	var envelope struct {
+		Subject string `json:"subject"`
 	}
+	body := []byte(payload)
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return message{}, err
+	}
+	s := envelope.Subject
+	if s == "" || strings.HasPrefix(s, ".") || strings.HasSuffix(s, ".") ||
+		strings.Contains(s, "..") || strings.ContainsAny(s, " \t\r\n*>\x00") {
+		return message{}, errors.New("invalid NATS publish subject")
+	}
+	return message{subject: s, body: body}, nil
+}
 
-	fmt.Printf("Channel: %s\n", topic)
-	
-	fmt.Printf("Connecting to NATS: %s \n", natHost)
-	nc, _ := nats.Connect(natHost)
-
-
-	// get a connection pool
-	pool, err := pgxpool.New(ctx, url)
+func listen(ctx context.Context, cfg *pgx.ConnConfig, channel string, out chan<- message) error {
+	conn, err := pgx.ConnectConfig(ctx, cfg)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error connection to DB: %v", err)
-		os.Exit(1)
+		// Connection errors may include the DSN.
+		return errors.New("could not connect to PostgreSQL")
 	}
-	if err = pool.Ping(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "error pinging DB: %v", err)
-		os.Exit(1)
+	defer conn.Close(context.Background())
+	if _, err := conn.Exec(ctx, "LISTEN "+pgx.Identifier{channel}.Sanitize()); err != nil {
+		return fmt.Errorf("LISTEN: %w", err)
 	}
-
-	// setup the listener
-	li := notifier.NewListener(pool)
-	if err := li.Connect(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "error setting up listener: %v", err)
-		os.Exit(1)
+	log.Printf("listening on PostgreSQL channel %q", channel)
+	for {
+		n, err := conn.WaitForNotification(ctx)
+		if err != nil {
+			return err
+		}
+		m, err := parseMessage(n.Payload)
+		if err != nil {
+			log.Printf("skipping malformed notification: %v", err)
+			continue
+		}
+		select {
+		case out <- m:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
+}
 
-	// setup the notifier
-	n := notifier.NewNotifier(l, li)
-	go n.Run(ctx)
+func waitRetry(ctx context.Context) {
+	select {
+	case <-time.After(retryDelay):
+	case <-ctx.Done():
+	}
+}
 
-	// subscribe to the topic
-	sub := n.Listen(topic)
-
-	// indefinitely listen for updates
-	go func() {
-		<-sub.EstablishedC()
-		for {
-			select {
-			case <-ctx.Done():
-				sub.Unlisten(ctx)
-				fmt.Println("done listening for notifications")
-				return
-			case p := <-sub.NotificationC():
-				//fmt.Printf("Got notification: %s\n", p)
-				subject := gjson.Get(string(p), "subject") 
-				nc.Publish(subject.String(), []byte(p))
+func publishBatch(nc *nats.Conn, batch []message) error {
+	for _, m := range batch {
+		if err := nc.Publish(m.subject, m.body); err != nil {
+			if errors.Is(err, nats.ErrMaxPayload) {
+				log.Printf("skipping notification larger than broker limit (%d bytes)", len(m.body))
+				continue
 			}
+			return err
+		}
+	}
+	return nc.FlushTimeout(5 * time.Second)
+}
+
+func publish(ctx context.Context, host string, in <-chan message) {
+	var nc *nats.Conn
+	defer func() {
+		if nc != nil {
+			nc.Close()
 		}
 	}()
-
-	// unsubscribe after some time
-	/*
-	go func() {
-		time.Sleep(20 * time.Second)
-		sub.Unlisten(ctx)
-	}()
-	*/
-
-	select {}
-}
-
-func getDefaultLogger(lvl slog.Level) *slog.Logger {
-	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		AddSource: true,
-		Level:     lvl,
-		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
-			if a.Key == slog.SourceKey {
-				source, _ := a.Value.Any().(*slog.Source)
-				if source != nil {
-					source.Function = ""
-					source.File = filepath.Base(source.File)
+	for first := range in {
+		// This is the sole consumer. Take only messages already queued so an
+		// isolated update is sent immediately.
+		available := min(len(in), batchSize-1)
+		batch := make([]message, 1, 1+available)
+		batch[0] = first
+		for range available {
+			batch = append(batch, <-in)
+		}
+		retrying := false
+		for {
+			if ctx.Err() != nil {
+				log.Printf("shutdown with %d unconfirmed or queued notifications", len(batch)+len(in))
+				return
+			}
+			var err error
+			if nc == nil {
+				// We retain the batch ourselves. Never let a reconnect move a
+				// flush onto a different connection than its publishes.
+				nc, err = nats.Connect(host, nats.NoReconnect(), nats.Timeout(2*time.Second))
+				if err != nil {
+					err = errors.New("could not connect to NATS")
 				}
 			}
-			return a
-		},
-	}))
+			if err == nil {
+				err = publishBatch(nc, batch)
+			}
+			if err == nil {
+				if retrying {
+					log.Print("NATS delivery resumed")
+				}
+				break
+			}
+			if nc != nil {
+				nc.Close()
+				nc = nil
+			}
+			if !retrying {
+				log.Printf("NATS delivery interrupted: %v; retrying batch of %d", err, len(batch))
+				retrying = true
+			}
+			waitRetry(ctx)
+		}
+	}
 }
 
+func main() {
+	url := flag.String("dbhost", "", "PostgreSQL connection string")
+	channel := flag.String("channel", "", "PostgreSQL notification channel")
+	host := flag.String("nathost", "", "NATS URL")
+	flag.Parse()
+	if *url == "" || *channel == "" || *host == "" {
+		log.Fatal("dbhost, channel and nathost are required")
+	}
+	cfg, err := pgx.ParseConfig(*url)
+	if err != nil {
+		log.Fatal("invalid PostgreSQL connection string")
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	out := make(chan message, queueSize)
+	writerCtx, cancelWriter := context.WithCancel(context.Background())
+	defer cancelWriter()
+	go func() {
+		defer close(out)
+		for ctx.Err() == nil {
+			err := listen(ctx, cfg, *channel, out)
+			if ctx.Err() != nil {
+				break
+			}
+			log.Printf("PostgreSQL listener unavailable: %v; resubscribing", err)
+			waitRetry(ctx)
+		}
+	}()
+	go func() {
+		<-ctx.Done()
+		// Allow already received messages to drain within Docker's stop timeout.
+		time.AfterFunc(5*time.Second, cancelWriter)
+	}()
+	publish(writerCtx, *host, out)
+}
