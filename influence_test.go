@@ -50,25 +50,7 @@ func TestInfluenceParts(t *testing.T) {
 		t.Fatal("multipart bytes changed")
 	}
 }
-func TestInfluenceReplayValidation(t *testing.T) {
-	for _, s := range []string{"structs.influence.replay.test.1.scores", "structs.influence.replay.test.1.player.1-12"} {
-		if _, e := replaySubject(s); e != nil {
-			t.Fatal(e)
-		}
-	}
-	for _, s := range []string{"structs.player.1-12", "structs.influence.replay.test.1.player.*", "structs.influence.replay.test.0.scores", "structs.influence.replay.test.1.unknown"} {
-		if _, e := replaySubject(s); e == nil {
-			t.Fatal("accepted", s)
-		}
-	}
-	for _, s := range []string{"-1", "1.5", "1e2", "9223372036854775808"} {
-		if _, e := exactCursor(s); e == nil {
-			t.Fatal("accepted", s)
-		}
-	}
-}
-
-func TestIntegrationInfluenceOutboxReplay(t *testing.T) {
+func TestIntegrationInfluenceOutboxReadOnlyClients(t *testing.T) {
 	dsn, host := os.Getenv("GRASS_TEST_DATABASE_URL"), os.Getenv("GRASS_TEST_NATS_URL")
 	if dsn == "" || host == "" {
 		t.Skip("disposable PG/NATS required")
@@ -83,7 +65,11 @@ func TestIntegrationInfluenceOutboxReplay(t *testing.T) {
 		t.Fatal(e)
 	}
 	defer db.Close(ctx)
-	nc, e := nats.Connect(host)
+	readerHost := os.Getenv("GRASS_TEST_NATS_READER_URL")
+	if readerHost == "" {
+		t.Fatal("read-only NATS fixture URL required")
+	}
+	nc, e := nats.Connect(readerHost)
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -99,7 +85,7 @@ func TestIntegrationInfluenceOutboxReplay(t *testing.T) {
 		t.Fatal(e)
 	}
 	var id int64
-	// A genuinely oversized frame spans several bounded replay pages.
+	// A genuinely oversized frame arrives completely through a read-only subscription.
 	body := map[string]any{"contract": influenceContract, "subject": subject, "category": "influence_scores", "mode": "replace", "previous_frame_id": "0", "data": strings.Repeat("星🌌", 40000)}
 	raw, _ := json.Marshal(body)
 	if e = db.QueryRow(ctx, `INSERT INTO structs.influence_grass_frame(contest_id,build_id,height,subject,payload) VALUES(999999,999999,1,$1,$2) RETURNING frame_id`, subject, raw).Scan(&id); e != nil {
@@ -121,7 +107,12 @@ func TestIntegrationInfluenceOutboxReplay(t *testing.T) {
 		return cancel, done
 	}
 	cancel, done := start()
-	defer func() { cancel(); <-done }()
+	defer func() {
+		if done != nil {
+			cancel()
+			<-done
+		}
+	}()
 	var canonical string
 	if e = db.QueryRow(ctx, `SELECT payload::text FROM structs.influence_grass_frame WHERE frame_id=$1`, id).Scan(&canonical); e != nil {
 		t.Fatal(e)
@@ -147,67 +138,18 @@ func TestIntegrationInfluenceOutboxReplay(t *testing.T) {
 			t.Fatal("checkpoint not advanced")
 		}
 	}
-	// Restart the relay: replay remains available despite acknowledged delivery.
+	// Restarting after an acknowledged flush must not resend delivered frames.
 	cancel()
 	<-done
+	done = nil
 	cancel, done = start()
-	time.Sleep(250 * time.Millisecond)
-	cursor := influenceReplayRequest{After: "0"}
-	var replayed [][]byte
-	for page := 0; page < 100; page++ {
-		inbox := nats.NewInbox()
-		reply, e := nc.SubscribeSync(inbox)
-		if e != nil {
-			t.Fatal(e)
-		}
-		request, _ := json.Marshal(cursor)
-		if e = nc.PublishRequest("structs.influence.replay.relay-test.999999.scores", inbox, request); e != nil {
-			t.Fatal(e)
-		}
-		finished := false
-		for {
-			m, e := reply.NextMsg(10 * time.Second)
-			if e != nil {
-				reply.Unsubscribe()
-				t.Fatal(e)
-			}
-			var category struct {
-				Category string `json:"category"`
-			}
-			if e = json.Unmarshal(m.Data, &category); e != nil {
-				t.Fatal(e)
-			}
-			if category.Category == "influence_replay_end" {
-				var end influenceReplayEnd
-				_ = json.Unmarshal(m.Data, &end)
-				if end.Error != "" {
-					t.Fatal(end.Error)
-				}
-				cursor = influenceReplayRequest{end.After, end.Through, end.Part}
-				finished = end.Done
-				break
-			}
-			replayed = append(replayed, m.Data)
-		}
-		reply.Unsubscribe()
-		if finished {
-			break
-		}
-		if page == 99 {
-			t.Fatal("replay did not terminate")
-		}
-	}
-	if len(replayed) != len(expected) {
-		t.Fatal("lost replay parts", len(replayed), len(expected))
-	}
-	for i := range expected {
-		if !bytes.Equal(replayed[i], expected[i]) {
-			t.Fatal("replay identity changed")
-		}
+	if _, e = live.NextMsg(300 * time.Millisecond); e != nats.ErrTimeout {
+		t.Fatalf("unexpected resend: %v", e)
 	}
 	// Delivery outage: a committed frame without NOTIFY survives and is found on restart.
 	cancel()
 	<-done
+	done = nil
 	if _, e = db.Exec(ctx, `INSERT INTO structs.influence_grass_frame(contest_id,build_id,height,subject,payload) VALUES(999999,999999,2,$1,'{"offline":true}')`, subject); e != nil {
 		t.Fatal(e)
 	}

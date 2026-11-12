@@ -150,7 +150,7 @@ func main() {
 	url := flag.String("dbhost", "", "PostgreSQL connection string")
 	channel := flag.String("channel", "", "PostgreSQL notification channel")
 	host := flag.String("nathost", "", "NATS URL")
-	influenceEnabled := flag.Bool("influence", true, "Drain the influence outbox and serve grass replay")
+	influenceEnabled := flag.Bool("influence", true, "Publish complete influence updates from the durable outbox")
 	destination := flag.String("influence-destination", "default", "Stable checkpoint name for this NATS destination")
 	flag.Parse()
 	if *url == "" || *channel == "" || *host == "" {
