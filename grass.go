@@ -150,6 +150,8 @@ func main() {
 	url := flag.String("dbhost", "", "PostgreSQL connection string")
 	channel := flag.String("channel", "", "PostgreSQL notification channel")
 	host := flag.String("nathost", "", "NATS URL")
+	influenceEnabled := flag.Bool("influence", true, "Drain the influence outbox and serve grass replay")
+	destination := flag.String("influence-destination", "default", "Stable checkpoint name for this NATS destination")
 	flag.Parse()
 	if *url == "" || *channel == "" || *host == "" {
 		log.Fatal("dbhost, channel and nathost are required")
@@ -160,6 +162,9 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if *influenceEnabled {
+		go runInfluence(ctx, cfg, *host, *destination)
+	}
 	out := make(chan message, queueSize)
 	writerCtx, cancelWriter := context.WithCancel(context.Background())
 	defer cancelWriter()

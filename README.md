@@ -17,7 +17,7 @@ In the distant future the species of the galaxy are embroiled in a race for Alph
 
 ## Get started
 ```bash
-go build grass.go  
+go build .
 grass -channel grass -dbhost postgres://structs_indexer@localhost:5432/structs -nathost nats://127.0.0.1:4222 
 ```
 
@@ -53,3 +53,75 @@ PostgreSQL connection.
 ## License
 
 Most of this was written by Jon Brown in this [blog post](https://brojonat.com/posts/go-postgres-listen-notify/), so it doesn't feel right to plaster a license on.
+
+## Influence: complete state updates and replay
+
+Influence uses a separate durable outbox from structs-pg
+`influence-grass-20261111`. Build this package with `go build .`, not `go build grass.go`. `-influence=true` (default) runs the ordered outbox drain alongside the
+ordinary notification relay; `-influence=false` disables that worker.
+`-influence-destination=default` names a persistent SQL delivery checkpoint. Keep
+that name stable across restarts and unique for independent NATS destinations.
+The paired sync-state writer must call `influence_grass_flush` after each block.
+
+This path has **no stubs and no API-refetch messages**. PostgreSQL NOTIFY is only
+a wakeup. The relay publishes committed payloads and advances its checkpoint only
+after a successful NATS flush. It polls after missed wakeups and drains on startup.
+A database session advisory lock permits one publisher per destination. Retries
+can duplicate frames; clients deduplicate by exact frame ID. All outbox frames
+remain available for client replay after the delivery cursor advances.
+
+Each live packet has this envelope:
+
+```json
+{
+  "contract":"structs-influence-grass-v1",
+  "subject":"structs.influence.structstestnet-111.1.scores",
+  "category":"influence_part",
+  "frame_id":"123",
+  "part_index":0,
+  "part_count":2,
+  "sha256":"<digest of complete UTF-8 JSON bytes>",
+  "encoding":"base64",
+  "payload":"<base64 chunk>"
+}
+```
+
+Raw chunks are always 4,096 bytes, independent of connection and broker, so live
+and replay parts are identical. NATS `max_payload` must be at least 8,192 bytes.
+Reassemble in index order, verify the digest, decode JSON, then atomically apply
+the complete frame. Never apply a partial frame. Reconstructed envelopes contain
+current values, block/generation identity, per-scope `previous_frame_id`, and
+history deltas or bounded replacement segments. Refer to
+`structs-pg/docs/influence-grass-20261111.md` for the categories and semantics.
+
+To recover an offline client using Core NATS:
+
+1. Subscribe to the exact live scope first and buffer its live frames.
+2. Subscribe to a fresh `_INBOX.<random>` reply subject. Publish a JSON request
+   to the live subject with `replay.` inserted after `structs.influence.`:
+   `structs.influence.replay.<chain>.<contest>.<scope>`.
+3. Send `{"after_frame_id":"123","part_index":0}`. Use `"0"` for initial
+   bootstrap: retained replacement state/history means no HTTP bootstrap is
+   required either. All IDs are decimal strings, never JavaScript numbers.
+   Replay starts at the latest replacement within the pinned range when one
+   supersedes the saved cursor, avoiding obsolete generations.
+4. Receive up to 32 `influence_part` packets and a final
+   `influence_replay_end`. The final packet contains `subject`, `after_frame_id`,
+   `through_frame_id`, `part_index`, and `done` (or `error`). Send those three
+   cursor fields in the next request. `through_frame_id` pins the upper bound;
+   `part_index` resumes a partially delivered frame without skipping its prefix.
+5. Continue until `done:true`, then apply queued live frames in order, ignoring
+   duplicates. On timeout, retry from the last fully applied scope frame.
+
+Replay queries only the requested scope, has a five-second DB deadline, caps
+request bytes and concurrent queued requests, and never returns an HTTP URL.
+History replacement uses at most 512 rows per logical frame. Current rosters can
+span many parts/pages. A slow or missing broker does not discard influence
+frames. Retention is currently explicit: **do not prune the outbox**, because
+client replay depends on it. Core NATS flush is still not a client acknowledgment.
+
+NATS permissions must permit scoped live subscriptions, their corresponding
+replay requests, reply inbox subscriptions, and the relay's reply publications.
+These subjects contain public gameplay scores, not private account data. The
+SQL connection uses the existing `structs_indexer` grants. Existing non-influence
+messages retain the live-only semantics described above.
